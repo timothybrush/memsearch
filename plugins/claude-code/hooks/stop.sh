@@ -78,7 +78,7 @@ SESSION_ID=$(basename "$TRANSCRIPT_PATH" .jsonl)
 LAST_USER_TURN_UUID=$(python3 -c "
 import json, sys
 uuid = ''
-with open(sys.argv[1]) as f:
+with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
     for line in f:
         try:
             obj = json.loads(line)
