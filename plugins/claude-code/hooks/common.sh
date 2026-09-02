@@ -157,12 +157,82 @@ _installed_version_from_dist_info() {
   done
 }
 
-# Latest memsearch version on PyPI, cached for 24h. Keeps the update hint
-# current without making every session start wait on a network round trip: an
-# unreachable PyPI otherwise costs the full curl timeout on every start.
-# Prints nothing when the lookup fails.
+# Parse the supported suffixes into their public-version order. Local labels
+# are handled separately because a public index must not advertise the same
+# public version as an upgrade over an installed local build.
+_version_suffix_key() {
+  local suffix="${1#.}" number
+  case "$suffix" in
+    "") _VERSION_SUFFIX_RANK=4; _VERSION_SUFFIX_NUMBER=0; return 0 ;;
+    dev*) _VERSION_SUFFIX_RANK=0; number=${suffix#dev} ;;
+    a*) _VERSION_SUFFIX_RANK=1; number=${suffix#a} ;;
+    b*) _VERSION_SUFFIX_RANK=2; number=${suffix#b} ;;
+    rc*) _VERSION_SUFFIX_RANK=3; number=${suffix#rc} ;;
+    post*) _VERSION_SUFFIX_RANK=5; number=${suffix#post} ;;
+    *) return 1 ;;
+  esac
+  case "$number" in ""|*[!0-9]*) return 1 ;; esac
+  [ "${#number}" -le 9 ] || return 1
+  _VERSION_SUFFIX_NUMBER=$((10#$number))
+}
+
+# True when the first version is strictly newer than the second. Release fields
+# compare numerically; dev, a, b, rc, final, and post suffixes follow that order.
+# Local labels are ignored after validating their shape. Unknown versions stay
+# silent because guessing their order could emit a downgrade hint.
+_version_gt() {
+  local a="$1" b="$2" a_local="" b_local="" a_release b_release a_suffix b_suffix
+  local ax bx a_rank b_rank a_number b_number local_part
+
+  case "$a" in *+*) a_local=${a#*+}; a=${a%%+*} ;; esac
+  case "$b" in *+*) b_local=${b#*+}; b=${b%%+*} ;; esac
+  for local_part in "$a_local" "$b_local"; do
+    case "$local_part" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  done
+  [ "$1" = "$a" ] || [ -n "$a_local" ] || return 1
+  [ "$2" = "$b" ] || [ -n "$b_local" ] || return 1
+
+  a_release=${a%%[!0-9.]*}
+  b_release=${b%%[!0-9.]*}
+  case "$a_release" in *.) [ "$a" != "$a_release" ] || return 1; a_release=${a_release%.} ;; esac
+  case "$b_release" in *.) [ "$b" != "$b_release" ] || return 1; b_release=${b_release%.} ;; esac
+  case "$a_release" in ""|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+  case "$b_release" in ""|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+  a_suffix=${a#$a_release}
+  b_suffix=${b#$b_release}
+
+  _version_suffix_key "$a_suffix" || return 1
+  a_rank=$_VERSION_SUFFIX_RANK
+  a_number=$_VERSION_SUFFIX_NUMBER
+  _version_suffix_key "$b_suffix" || return 1
+  b_rank=$_VERSION_SUFFIX_RANK
+  b_number=$_VERSION_SUFFIX_NUMBER
+
+  while [ -n "$a_release" ] || [ -n "$b_release" ]; do
+    ax=${a_release%%.*}
+    bx=${b_release%%.*}
+    [ "${#ax}" -le 9 ] && [ "${#bx}" -le 9 ] || return 1
+    # 10# forces base ten so a zero-padded field is not read as octal.
+    ax=$((10#${ax:-0}))
+    bx=$((10#${bx:-0}))
+    [ "$ax" -gt "$bx" ] && return 0
+    [ "$ax" -lt "$bx" ] && return 1
+    case "$a_release" in *.*) a_release=${a_release#*.} ;; *) a_release="" ;; esac
+    case "$b_release" in *.*) b_release=${b_release#*.} ;; *) b_release="" ;; esac
+  done
+
+  [ "$a_rank" -gt "$b_rank" ] && return 0
+  [ "$a_rank" -lt "$b_rank" ] && return 1
+  [ "$a_number" -gt "$b_number" ]
+}
+
+# Latest memsearch version on PyPI, cached for 24h and refreshed off the
+# blocking path. Keeps the update hint current without making any session start
+# wait on a network round trip: a cache older than a day is still printed, and
+# the refresh runs in a detached child, so the hint is at most one session
+# stale. Prints nothing until the first lookup has answered.
 _pypi_latest_version() {
-  local cache="$HOME/.memsearch/.pypi-latest" latest json
+  local cache="$HOME/.memsearch/.pypi-latest" last
   # A cache file younger than a day is authoritative even when it is empty: an
   # empty file records a lookup that failed, so an offline machine stops
   # re-paying the curl timeout on every session start.
@@ -170,11 +240,27 @@ _pypi_latest_version() {
     cat "$cache" 2>/dev/null || true
     return 0
   fi
-  json=$(curl -s --max-time 2 https://pypi.org/pypi/memsearch/json 2>/dev/null || true)
-  latest=$(_json_val "$json" "info.version" "")
+  last=$(cat "$cache" 2>/dev/null || true)
   mkdir -p "$(dirname "$cache")" 2>/dev/null || true
-  printf '%s' "$latest" > "$cache" 2>/dev/null || true
-  printf '%s' "$latest"
+  # Only an answer marks the cache fresh: the child's mv is the sole writer of
+  # both the contents and the mtime. That keeps the sentence above true -- an
+  # empty fresh file records a lookup that ran and failed, never one that was
+  # merely started -- and a refresh that dies leaves the previous answer for the
+  # next start to retry. Concurrent starts may each spawn a lookup; off the
+  # blocking path that costs the session start nothing.
+  # Both fds must be redirected. The hook runner keeps a pipe on the hook's
+  # stderr, so `child >/dev/null &` still holds the session start open until the
+  # child exits (measured in #676). Same form as the Lite-mode index subshell.
+  (
+    local json latest tmp="$cache.$$"
+    json=$(curl -s --max-time 2 https://pypi.org/pypi/memsearch/json 2>/dev/null || true)
+    latest=$(_json_val "$json" "info.version" "")
+    if printf '%s' "$latest" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$cache" 2>/dev/null || true
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+  ) </dev/null >/dev/null 2>&1 &
+  printf '%s' "$last"
 }
 
 # Return a concise user-facing warning when the persisted index state says
